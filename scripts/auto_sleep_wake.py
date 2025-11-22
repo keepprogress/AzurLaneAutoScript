@@ -376,6 +376,15 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     """
     計算休眠計劃
 
+    休眠條件很簡單：
+    1. 有排程任務
+    2. 下一個任務時間 > MIN_SLEEP_MINUTES（預設 10 分鐘）
+    3. 下一個任務時間 < MAX_SLEEP_HOURS（預設 8 小時）
+
+    不檢查 pending_task，因為：
+    - 如果調度器在運行，它會自動執行 pending 任務
+    - 如果調度器停止，pending 永遠不會清空，會導致永遠不休眠
+
     Returns:
         (should_sleep, wake_time, reason)
     """
@@ -386,10 +395,16 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
 
     now = datetime.now()
 
-    # 檢查是否有待執行任務
-    pending_count = check_pending_tasks(config_name)
-    if pending_count > 0:
-        return False, None, f"還有 {pending_count} 個任務待執行"
+    # 如果下一個任務時間已經過了（pending 狀態），找下一個 waiting 任務
+    if next_run <= now:
+        # 找第一個時間還沒到的任務
+        for task in all_tasks:
+            if task.next_run > now:
+                next_run = task.next_run
+                break
+        else:
+            # 所有任務時間都過了，不休眠（讓調度器去執行）
+            return False, None, "所有任務時間已到，等待調度器執行"
 
     # 計算到下一個任務的時間
     wake_time = next_run - timedelta(minutes=CONFIG['WAKE_BUFFER_MINUTES'])
@@ -397,25 +412,24 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
 
     # 檢查最小休眠時間
     if sleep_minutes < CONFIG['MIN_SLEEP_MINUTES']:
-        return False, None, f"休眠時間 {sleep_minutes:.1f} 分鐘太短"
+        return False, None, f"距離下個任務只有 {sleep_minutes:.1f} 分鐘，不休眠"
 
-    # 檢查最大休眠時間
+    # 檢查最大休眠時間（避免半夜無意義喚醒）
     max_minutes = CONFIG['MAX_SLEEP_HOURS'] * 60
     if sleep_minutes > max_minutes:
-        return False, None, f"休眠時間 {sleep_minutes/60:.1f} 小時太長，可能是明天的任務"
+        return False, None, f"距離下個任務 {sleep_minutes/60:.1f} 小時太長，保持運行"
 
-    return True, wake_time, f"計劃休眠 {sleep_minutes:.1f} 分鐘"
+    return True, wake_time, f"計劃休眠 {sleep_minutes:.1f} 分鐘，{wake_time.strftime('%H:%M')} 喚醒"
 
 
 def run_single_cycle(alas_path: str, config_name: str, no_sleep: bool = False):
     """
     執行單次休眠-喚醒循環
 
+    簡化邏輯：
     1. 確保 ALAS 運行
-    2. 等待當前任務完成
-    3. 計算下一次喚醒時間
-    4. 創建喚醒任務
-    5. 進入睡眠
+    2. 計算下一次喚醒時間（只看時間，不管 pending）
+    3. 如果時間合適，創建喚醒任務並休眠
     """
     logger.info("=" * 50)
     logger.info("ALAS Auto Sleep/Wake Manager v2.0")
@@ -424,10 +438,7 @@ def run_single_cycle(alas_path: str, config_name: str, no_sleep: bool = False):
     # 確保 ALAS 運行
     ensure_alas_running(config_name)
 
-    # 等待當前任務完成
-    wait_for_alas_tasks_complete(config_name)
-
-    # 重新獲取排程並計算休眠計劃
+    # 計算休眠計劃（只基於時間條件）
     should_sleep, wake_time, reason = calculate_sleep_plan(config_name)
 
     logger.info(f"休眠計劃: {reason}")
