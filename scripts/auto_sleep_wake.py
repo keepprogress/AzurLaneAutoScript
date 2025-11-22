@@ -220,67 +220,12 @@ def start_webui() -> bool:
     return False
 
 
-def click_webui_start_button_uia(config_name: str = 'alas', debug: bool = True) -> bool:
+def click_webui_start_button(config_name: str = 'alas') -> bool:
     """
-    使用 uiautomation 套件點擊 ALAS「啟動」按鈕
-    uiautomation 是高級封裝，自動處理所有 COM 問題
-    """
-    try:
-        import uiautomation as auto
-    except ImportError:
-        logger.warning("uiautomation 未安裝: pip install uiautomation")
-        return False
+    通過 win32gui + 相對座標點擊 WebUI 的「啟動」按鈕
 
-    try:
-        logger.info("使用 UIA 搜索啟動按鈕...")
-
-        # 搜索「启动」按鈕（在整個桌面搜索）
-        button_names = ["启动", "啟動", "Start"]
-
-        for name in button_names:
-            # 直接在桌面搜索指定名稱的控件
-            button = auto.Control(Name=name, searchDepth=20)
-            if button.Exists(maxSearchSeconds=2):
-                logger.info(f"UIA 找到控件: Name='{name}', Type={button.ControlTypeName}")
-
-                # 嘗試點擊
-                try:
-                    button.Click(simulateMove=False)
-                    logger.info("UIA Click 成功")
-                    return True
-                except Exception as e:
-                    if debug:
-                        logger.debug(f"Click 失敗: {e}")
-
-                # 備援：用座標點擊
-                try:
-                    rect = button.BoundingRectangle
-                    x, y = rect.xcenter(), rect.ycenter()
-                    if x > 0 and y > 0:
-                        import pyautogui
-                        pyautogui.click(x, y)
-                        logger.info(f"UIA + pyautogui 點擊成功: ({x}, {y})")
-                        return True
-                except Exception as e:
-                    if debug:
-                        logger.debug(f"座標點擊失敗: {e}")
-
-        logger.info("UIA 未找到啟動按鈕")
-        return False
-
-    except Exception as e:
-        logger.error(f"UIA 自動化失敗: {e}")
-        if debug:
-            import traceback
-            logger.error(traceback.format_exc())
-        return False
-
-
-def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> bool:
-    """
-    通過 win32gui 點擊 WebUI 的「啟動」按鈕（備援方案）
-
-    使用 win32gui 查找窗口，然後用預設相對座標點擊
+    使用 win32gui 查找窗口，然後用相對座標點擊
+    ALAS WebUI 的啟動按鈕位置固定：水平 43%，垂直 10%
     """
     try:
         import win32gui
@@ -291,12 +236,10 @@ def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> b
         return False
 
     try:
-        # 方法1: 用 win32gui 快速找到 ALAS 窗口
-        logger.info("搜索 ALAS 窗口...")
-
+        # 查找 ALAS 窗口
         hwnd = win32gui.FindWindow(None, "Alas")
         if not hwnd:
-            # 如果找不到精確標題，用部分匹配
+            # 部分匹配搜索
             def enum_handler(hw, extra):
                 if win32gui.IsWindowVisible(hw):
                     title = win32gui.GetWindowText(hw)
@@ -308,14 +251,12 @@ def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> b
             win32gui.EnumWindows(enum_handler, hwnds)
             if hwnds:
                 hwnd, title = hwnds[0]
-                logger.info(f"找到窗口: {title} (hwnd={hwnd})")
+                logger.info(f"找到窗口: {title}")
             else:
                 logger.error("找不到 ALAS 窗口")
                 return False
-        else:
-            logger.info(f"找到窗口: Alas (hwnd={hwnd})")
 
-        # 激活窗口並帶到前台
+        # 激活窗口
         try:
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -324,70 +265,22 @@ def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> b
         except Exception as e:
             logger.warning(f"激活窗口失敗: {e}")
 
-        # 方法2: 查找子控件中的「启动」或「Start」按鈕
-        logger.info("搜索啟動按鈕...")
-
-        target_hwnd = None
-        button_texts = ['启动', 'Start', '啟動']
-
-        def enum_child(child_hwnd, extra):
-            nonlocal target_hwnd
-            try:
-                class_name = win32gui.GetClassName(child_hwnd)
-                # 檢查是否是按鈕類型的控件
-                if class_name in ("Button", "Static", "Chrome_RenderWidgetHostHWND"):
-                    title = win32gui.GetWindowText(child_hwnd)
-                    if title and win32gui.IsWindowVisible(child_hwnd):
-                        for btn_text in button_texts:
-                            if btn_text in title or title == btn_text:
-                                target_hwnd = child_hwnd
-                                logger.info(f"找到按鈕控件: '{title}' (class={class_name})")
-                                return False  # 找到就停止
-                        if debug and title:
-                            logger.debug(f"  子控件: '{title}' (class={class_name})")
-            except:
-                pass
-            return True
-
-        win32gui.EnumChildWindows(hwnd, enum_child, None)
-
-        if target_hwnd:
-            # 取得按鈕中心點座標並點擊
-            rect = win32gui.GetWindowRect(target_hwnd)
-            x = (rect[0] + rect[2]) // 2
-            y = (rect[1] + rect[3]) // 2
-            logger.info(f"點擊按鈕位置: ({x}, {y})")
-            pyautogui.click(x, y)
-            logger.info("成功點擊啟動按鈕")
-            return True
-
-        # 方法3: Electron 應用可能沒有原生控件，使用預設位置
-        logger.info("未找到原生按鈕控件，嘗試預設位置...")
-
+        # 使用相對座標點擊啟動按鈕
         rect = win32gui.GetWindowRect(hwnd)
         left, top, right, bottom = rect
         width = right - left
         height = bottom - top
 
-        if debug:
-            logger.info(f"[DEBUG] 窗口位置: left={left}, top={top}, width={width}, height={height}")
-
-        # ALAS WebUI 的啟動按鈕位置（根據截圖佈局）
-        # 「启动」按鈕在左上方，「调度器」標題的右邊
-        # 水平方向約 43%，垂直方向約 10%
+        # ALAS WebUI 的啟動按鈕位置：水平 43%，垂直 10%
         button_x = left + int(width * 0.43)
         button_y = top + int(height * 0.10)
 
-        logger.info(f"嘗試點擊預設位置: ({button_x}, {button_y})")
+        logger.info(f"點擊啟動按鈕: ({button_x}, {button_y})")
         pyautogui.click(button_x, button_y)
-        logger.info("已點擊預設位置")
         return True
 
     except Exception as e:
-        logger.error(f"GUI 自動化失敗: {e}")
-        if debug:
-            import traceback
-            logger.error(traceback.format_exc())
+        logger.error(f"GUI 點擊失敗: {e}")
         return False
 
 
@@ -858,9 +751,10 @@ def ensure_alas_running(config_name: str) -> bool:
     確保 ALAS 調度器正在運行
 
     啟動優先順序：
-    1. ProcessManager（最快、最可靠、支援任意配置）
-    2. 直接執行 alas.py（備援，只支援 'alas' 配置）
-    3. WebUI + reloadalas（需要啟動 WebUI）
+    1. GUI 點擊（如果 WebUI 運行中）
+    2. ProcessManager（GUI 失敗時備援）
+    3. 直接執行 alas.py（最終備援）
+    4. 啟動 WebUI + reloadalas
     """
     # 檢查調度器進程是否在運行
     if check_alas_process_running(config_name):
@@ -870,34 +764,39 @@ def ensure_alas_running(config_name: str) -> bool:
     # 調度器未運行，啟動它
     logger.info(f"調度器 [{config_name}] 未運行，正在啟動...")
 
-    # 方法1：ProcessManager（最快、最可靠）
-    logger.info("嘗試方法1: ProcessManager 直接啟動...")
+    # 方法1：GUI 點擊（如果 WebUI 運行中）
+    webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
+    if webui_running:
+        logger.info("嘗試方法1: GUI 點擊啟動按鈕...")
+        if click_webui_start_button(config_name):
+            time.sleep(3)
+            if check_alas_process_running(config_name):
+                logger.info(f"調度器 [{config_name}] 已啟動（GUI 點擊）")
+                return True
+
+    # 方法2：ProcessManager（GUI 失敗時備援）
+    logger.info("嘗試方法2: ProcessManager 直接啟動...")
     if start_scheduler_via_processmanager(config_name):
-        # ProcessManager 已在內部等待確認，這裡再檢查一次
         time.sleep(2)
         if check_alas_process_running(config_name):
             logger.info(f"調度器 [{config_name}] 已啟動（ProcessManager）")
             return True
 
-    # 方法2：直接啟動 alas.py（備援）
-    logger.info("嘗試方法2: 直接啟動 alas.py...")
+    # 方法3：直接啟動 alas.py（最終備援）
+    logger.info("嘗試方法3: 直接啟動 alas.py...")
     if start_scheduler_directly(config_name):
-        # 等待調度器啟動
         for i in range(15):
             time.sleep(2)
             if check_alas_process_running(config_name):
                 logger.info(f"調度器 [{config_name}] 已啟動（直接執行）")
                 return True
 
-    # 方法3：通過 WebUI 啟動
-    logger.info("嘗試方法3: 通過 WebUI 啟動...")
-    webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
-
+    # 方法4：啟動 WebUI + reloadalas
     if not webui_running:
+        logger.info("嘗試方法4: 啟動 WebUI...")
         trigger_alas_start(config_name)
         start_webui()
 
-        # 等待 WebUI 啟動
         for i in range(30):
             time.sleep(2)
             if check_webui_port(CONFIG['WEBUI_PORT']):
@@ -905,21 +804,6 @@ def ensure_alas_running(config_name: str) -> bool:
                 return True
 
         logger.error("WebUI 啟動失敗")
-        return False
-
-    # WebUI 已運行但調度器沒啟動 - 嘗試點擊啟動按鈕
-    logger.info("WebUI 已運行，嘗試通過 GUI 點擊啟動按鈕...")
-    if click_webui_start_button_uia(config_name):
-        time.sleep(3)
-        if check_alas_process_running(config_name):
-            logger.info(f"調度器 [{config_name}] 已啟動（UIA 點擊）")
-            return True
-
-    if click_webui_start_button(config_name):
-        time.sleep(3)
-        if check_alas_process_running(config_name):
-            logger.info(f"調度器 [{config_name}] 已啟動（座標點擊）")
-            return True
 
     logger.warning("所有啟動方法都失敗，請手動在 WebUI 點擊啟動按鈕")
     return False
@@ -1183,44 +1067,36 @@ def monitor_mode(alas_path: str, config_name: str):
             last_running_state = is_running
 
             if not is_running:
-                # 調度器停止，立即重啟（已有 60 秒檢查間隔，無需額外等待）
+                # 調度器停止，立即重啟
                 if not check_alas_process_running(config_name):
                     logger.info("正在重啟調度器...")
                     started = False
 
-                    # 方法1：ProcessManager（最快、最可靠）
-                    logger.info("嘗試方法1: ProcessManager 直接啟動...")
-                    if start_scheduler_via_processmanager(config_name):
-                        time.sleep(2)
-                        if check_alas_process_running(config_name):
-                            logger.info("調度器已成功重啟（ProcessManager）")
-                            last_running_state = True
-                            started = True
+                    # 方法1：GUI 點擊（如果 WebUI 運行中）
+                    webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
+                    if webui_running:
+                        logger.info("嘗試方法1: GUI 點擊啟動按鈕...")
+                        if click_webui_start_button(config_name):
+                            time.sleep(3)
+                            if check_alas_process_running(config_name):
+                                logger.info("調度器已成功重啟（GUI 點擊）")
+                                last_running_state = True
+                                started = True
 
-                    # 方法2：GUI 點擊（如果 WebUI 運行中）
+                    # 方法2：ProcessManager（GUI 失敗時備援）
                     if not started:
-                        webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
-                        if webui_running:
-                            logger.info("嘗試方法2: GUI 點擊啟動按鈕...")
-                            # 優先使用 UIA（最穩定），失敗再用相對座標
-                            if click_webui_start_button_uia(config_name):
-                                time.sleep(3)
-                                if check_alas_process_running(config_name):
-                                    logger.info("調度器已成功重啟（UIA 點擊）")
-                                    last_running_state = True
-                                    started = True
-                            if not started and click_webui_start_button(config_name):
-                                time.sleep(3)
-                                if check_alas_process_running(config_name):
-                                    logger.info("調度器已成功重啟（座標點擊）")
-                                    last_running_state = True
-                                    started = True
+                        logger.info("嘗試方法2: ProcessManager 直接啟動...")
+                        if start_scheduler_via_processmanager(config_name):
+                            time.sleep(2)
+                            if check_alas_process_running(config_name):
+                                logger.info("調度器已成功重啟（ProcessManager）")
+                                last_running_state = True
+                                started = True
 
-                    # 方法3：直接啟動 alas.py（備援）
+                    # 方法3：直接啟動 alas.py（最終備援）
                     if not started:
                         logger.info("嘗試方法3: 直接啟動 alas.py...")
                         if start_scheduler_directly(config_name):
-                            # 等待調度器啟動
                             for i in range(10):
                                 time.sleep(2)
                                 if check_alas_process_running(config_name):
