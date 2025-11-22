@@ -10,13 +10,16 @@ ALAS Auto Sleep/Wake Manager v2.0
 4. 支援 daemon 模式持續運行
 
 運行方式：
-    方式1 (推薦): daemon 模式持續運行
+    方式1 (推薦): daemon 模式持續運行（監控 + 自動休眠）
         python auto_sleep_wake.py --daemon
 
-    方式2: 單次執行（由任務計劃喚醒後自動繼續循環）
+    方式2: 純監控模式（只監控調度器，停止後自動重啟，不休眠）
+        python auto_sleep_wake.py --monitor-only
+
+    方式3: 單次執行（由任務計劃喚醒後自動繼續循環）
         python auto_sleep_wake.py
 
-    方式3: 檢查狀態
+    方式4: 檢查狀態
         python auto_sleep_wake.py --check-only
 
 設置開機自啟動：
@@ -51,10 +54,11 @@ CONFIG = {
     'DAEMON_CHECK_INTERVAL': 60,   # daemon 模式檢查間隔（秒）
     'USE_HIBERNATE': False,        # True=休眠, False=睡眠
     'KILL_AUDIO_BEFORE_SLEEP': True,  # 睡眠前殺掉音訊進程
+    'RESTART_DELAY_SECONDS': 5,       # 監控模式：檢測到停止後等待重啟的秒數
 
     # === 自動休眠時間限制 ===
     'AUTO_SLEEP_SCHEDULE': True,   # 啟用時間限制
-    'SLEEP_DAYS': [0, 1, 2, 3, 4], # 允許自動休眠的星期（0=週一, 4=週五）
+    'SLEEP_DAYS': [0, 1, 2, 3, 4, 5], # 允許自動休眠的星期（0=週一, 4=週五）
     'SLEEP_START_HOUR': 1,         # 開始自動休眠的時間（01:00）
     'SLEEP_END_HOUR': 19,          # 結束自動休眠的時間（19:00）
     # 說明：週一到週五 01:00-19:00 之間會自動休眠，其他時間不休眠
@@ -216,7 +220,178 @@ def start_webui() -> bool:
     return False
 
 
-def start_scheduler_directly(config_name: str = 'alas') -> bool:
+def click_webui_start_button_uia(config_name: str = 'alas', debug: bool = True) -> bool:
+    """
+    使用 uiautomation 套件點擊 ALAS「啟動」按鈕
+    uiautomation 是高級封裝，自動處理所有 COM 問題
+    """
+    try:
+        import uiautomation as auto
+    except ImportError:
+        logger.warning("uiautomation 未安裝: pip install uiautomation")
+        return False
+
+    try:
+        logger.info("使用 UIA 搜索啟動按鈕...")
+
+        # 搜索「启动」按鈕（在整個桌面搜索）
+        button_names = ["启动", "啟動", "Start"]
+
+        for name in button_names:
+            # 直接在桌面搜索指定名稱的控件
+            button = auto.Control(Name=name, searchDepth=20)
+            if button.Exists(maxSearchSeconds=2):
+                logger.info(f"UIA 找到控件: Name='{name}', Type={button.ControlTypeName}")
+
+                # 嘗試點擊
+                try:
+                    button.Click(simulateMove=False)
+                    logger.info("UIA Click 成功")
+                    return True
+                except Exception as e:
+                    if debug:
+                        logger.debug(f"Click 失敗: {e}")
+
+                # 備援：用座標點擊
+                try:
+                    rect = button.BoundingRectangle
+                    x, y = rect.xcenter(), rect.ycenter()
+                    if x > 0 and y > 0:
+                        import pyautogui
+                        pyautogui.click(x, y)
+                        logger.info(f"UIA + pyautogui 點擊成功: ({x}, {y})")
+                        return True
+                except Exception as e:
+                    if debug:
+                        logger.debug(f"座標點擊失敗: {e}")
+
+        logger.info("UIA 未找到啟動按鈕")
+        return False
+
+    except Exception as e:
+        logger.error(f"UIA 自動化失敗: {e}")
+        if debug:
+            import traceback
+            logger.error(traceback.format_exc())
+        return False
+
+
+def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> bool:
+    """
+    通過 win32gui 點擊 WebUI 的「啟動」按鈕（備援方案）
+
+    使用 win32gui 查找窗口，然後用預設相對座標點擊
+    """
+    try:
+        import win32gui
+        import win32con
+        import pyautogui
+    except ImportError:
+        logger.error("需要安裝 pyautogui 和 pywin32: pip install pyautogui pywin32")
+        return False
+
+    try:
+        # 方法1: 用 win32gui 快速找到 ALAS 窗口
+        logger.info("搜索 ALAS 窗口...")
+
+        hwnd = win32gui.FindWindow(None, "Alas")
+        if not hwnd:
+            # 如果找不到精確標題，用部分匹配
+            def enum_handler(hw, extra):
+                if win32gui.IsWindowVisible(hw):
+                    title = win32gui.GetWindowText(hw)
+                    if 'Alas' in title or 'ALAS' in title:
+                        extra.append((hw, title))
+                return True
+
+            hwnds = []
+            win32gui.EnumWindows(enum_handler, hwnds)
+            if hwnds:
+                hwnd, title = hwnds[0]
+                logger.info(f"找到窗口: {title} (hwnd={hwnd})")
+            else:
+                logger.error("找不到 ALAS 窗口")
+                return False
+        else:
+            logger.info(f"找到窗口: Alas (hwnd={hwnd})")
+
+        # 激活窗口並帶到前台
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"激活窗口失敗: {e}")
+
+        # 方法2: 查找子控件中的「启动」或「Start」按鈕
+        logger.info("搜索啟動按鈕...")
+
+        target_hwnd = None
+        button_texts = ['启动', 'Start', '啟動']
+
+        def enum_child(child_hwnd, extra):
+            nonlocal target_hwnd
+            try:
+                class_name = win32gui.GetClassName(child_hwnd)
+                # 檢查是否是按鈕類型的控件
+                if class_name in ("Button", "Static", "Chrome_RenderWidgetHostHWND"):
+                    title = win32gui.GetWindowText(child_hwnd)
+                    if title and win32gui.IsWindowVisible(child_hwnd):
+                        for btn_text in button_texts:
+                            if btn_text in title or title == btn_text:
+                                target_hwnd = child_hwnd
+                                logger.info(f"找到按鈕控件: '{title}' (class={class_name})")
+                                return False  # 找到就停止
+                        if debug and title:
+                            logger.debug(f"  子控件: '{title}' (class={class_name})")
+            except:
+                pass
+            return True
+
+        win32gui.EnumChildWindows(hwnd, enum_child, None)
+
+        if target_hwnd:
+            # 取得按鈕中心點座標並點擊
+            rect = win32gui.GetWindowRect(target_hwnd)
+            x = (rect[0] + rect[2]) // 2
+            y = (rect[1] + rect[3]) // 2
+            logger.info(f"點擊按鈕位置: ({x}, {y})")
+            pyautogui.click(x, y)
+            logger.info("成功點擊啟動按鈕")
+            return True
+
+        # 方法3: Electron 應用可能沒有原生控件，使用預設位置
+        logger.info("未找到原生按鈕控件，嘗試預設位置...")
+
+        rect = win32gui.GetWindowRect(hwnd)
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+
+        if debug:
+            logger.info(f"[DEBUG] 窗口位置: left={left}, top={top}, width={width}, height={height}")
+
+        # ALAS WebUI 的啟動按鈕位置（根據截圖佈局）
+        # 「启动」按鈕在左上方，「调度器」標題的右邊
+        # 水平方向約 43%，垂直方向約 10%
+        button_x = left + int(width * 0.43)
+        button_y = top + int(height * 0.10)
+
+        logger.info(f"嘗試點擊預設位置: ({button_x}, {button_y})")
+        pyautogui.click(button_x, button_y)
+        logger.info("已點擊預設位置")
+        return True
+
+    except Exception as e:
+        logger.error(f"GUI 自動化失敗: {e}")
+        if debug:
+            import traceback
+            logger.error(traceback.format_exc())
+        return False
+
+
+def start_scheduler_directly(config_name: str = 'alas', debug: bool = True) -> bool:
     """
     直接啟動 ALAS 調度器（不依賴 WebUI）
 
@@ -225,8 +400,25 @@ def start_scheduler_directly(config_name: str = 'alas') -> bool:
     如果需要其他配置，需要通過 WebUI 啟動
     """
     try:
-        python_exe = sys.executable
+        # 優先使用 ALAS 自帶的 Python，而不是系統 Python
+        alas_python = Path(os.getcwd()) / 'toolkit' / 'python.exe'
+        if alas_python.exists():
+            python_exe = str(alas_python)
+        else:
+            # 備選：嘗試其他可能的位置
+            alas_python_alt = Path(os.getcwd()) / 'python' / 'python.exe'
+            if alas_python_alt.exists():
+                python_exe = str(alas_python_alt)
+            else:
+                python_exe = sys.executable
+                logger.warning(f"找不到 ALAS 自帶 Python，使用系統 Python: {python_exe}")
+
         alas_script = Path(os.getcwd()) / 'alas.py'
+
+        if debug:
+            logger.info(f"[DEBUG] Python 執行檔: {python_exe}")
+            logger.info(f"[DEBUG] alas.py 路徑: {alas_script}")
+            logger.info(f"[DEBUG] 工作目錄: {os.getcwd()}")
 
         if not alas_script.exists():
             logger.error(f"找不到 alas.py: {alas_script}")
@@ -239,33 +431,94 @@ def start_scheduler_directly(config_name: str = 'alas') -> bool:
 
         if os.name == 'nt':
             # Windows: 新視窗執行
-            subprocess.Popen(
+            logger.info(f"[DEBUG] 執行命令: {python_exe} {alas_script}")
+            process = subprocess.Popen(
                 [python_exe, str(alas_script)],
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 cwd=os.getcwd()
             )
+            logger.info(f"[DEBUG] 進程已啟動, PID: {process.pid}")
+
+            # 等待一小段時間，檢查進程是否立即退出
+            import time
+            time.sleep(2)
+
+            poll_result = process.poll()
+            if poll_result is not None:
+                logger.error(f"[DEBUG] 進程已退出，返回碼: {poll_result}")
+                return False
+            else:
+                logger.info(f"[DEBUG] 進程仍在運行")
         else:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [python_exe, str(alas_script)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 cwd=os.getcwd()
             )
+            logger.info(f"[DEBUG] 進程已啟動, PID: {process.pid}")
 
         logger.info(f"已直接啟動調度器")
         return True
     except Exception as e:
         logger.error(f"啟動調度器失敗: {e}")
+        import traceback
+        logger.error(f"[DEBUG] 詳細錯誤: {traceback.format_exc()}")
         return False
 
 
-def check_alas_process_running(config_name: str = 'alas') -> bool:
+def list_alas_related_processes():
+    """
+    列出所有可能與 ALAS 相關的進程（用於調試）
+    """
+    try:
+        import psutil
+        logger.info("=== 搜索 ALAS 相關進程 ===")
+        found = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline', []) or []
+                if not cmdline:
+                    continue
+                cmdline_str = ' '.join(cmdline).lower()
+
+                # 查找包含 alas 或 azurlane 的進程
+                if 'alas' in cmdline_str or 'azurlane' in cmdline_str:
+                    found.append({
+                        'pid': proc.pid,
+                        'name': proc.name(),
+                        'cmdline': cmdline
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if found:
+            for p in found:
+                logger.info(f"  PID: {p['pid']}, Name: {p['name']}")
+                logger.info(f"    Cmdline: {p['cmdline']}")
+        else:
+            logger.info("  沒有找到相關進程")
+        logger.info("=" * 30)
+        return found
+    except Exception as e:
+        logger.error(f"列出進程失敗: {e}")
+        return []
+
+
+def check_alas_process_running(config_name: str = 'alas', debug: bool = False) -> bool:
     """
     檢查 ALAS 調度器進程是否在運行
 
     檢測方式：
     1. 找 alas.py 進程（直接啟動）
-    2. 找包含 AzurLaneAutoScript 的進程（WebUI 啟動的子進程）
+    2. 找 ProcessManager 啟動的調度器進程（通過進程樹深度判斷）
+
+    WebUI 進程結構：
+    - gui.py (WebUI 主進程)
+      └── spawn 進程 (ProcessManager 創建，用於調度器)
+           └── spawn 進程 (實際執行任務的進程)
+
+    只有當存在 gui.py → spawn → spawn 這樣的三層結構時，才認為調度器在運行
 
     Returns:
         True = 調度器進程正在運行
@@ -274,31 +527,65 @@ def check_alas_process_running(config_name: str = 'alas') -> bool:
     try:
         import psutil
 
+        # 方法1：檢查 alas.py 直接啟動的進程
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline', []) or []
+                if not cmdline:
+                    continue
+
+                cmdline_str = ' '.join(cmdline).lower()
+
+                # 排除這個腳本本身和其他輔助腳本
+                if any(x in cmdline_str for x in ['auto_sleep_wake', 'check_running_task', 'alas_watchdog']):
+                    continue
+
+                # 檢查是否是 alas.py 進程（直接啟動）
+                if 'alas.py' in cmdline_str and 'python' in cmdline_str and 'gui.py' not in cmdline_str:
+                    if debug:
+                        logger.debug(f"找到 alas.py 進程: PID={proc.pid}")
+                    return True
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        # 方法2：檢查 WebUI 啟動的調度器
+        # 查找 gui.py 進程
+        gui_process = None
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 cmdline = proc.info.get('cmdline', []) or []
                 cmdline_str = ' '.join(cmdline).lower()
-
-                # 排除這個腳本本身
-                if 'auto_sleep_wake' in cmdline_str:
-                    continue
-                # 排除 WebUI 主進程
                 if 'gui.py' in cmdline_str:
-                    continue
-
-                # 檢查是否是 alas.py 進程（直接啟動）
-                if 'alas.py' in cmdline_str:
-                    return True
-
-                # 檢查是否是 WebUI 啟動的調度器子進程
-                # ProcessManager 啟動的進程會包含 config_name
-                if 'azurlaneautoscript' in cmdline_str or f'{config_name}' in cmdline_str:
-                    # 進一步確認是 Python 進程
-                    if 'python' in cmdline_str:
-                        return True
-
+                    gui_process = proc
+                    break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+
+        if gui_process:
+            # 查找 gui.py 的子進程
+            try:
+                children = gui_process.children(recursive=False)
+                for child in children:
+                    try:
+                        child_cmdline = ' '.join(child.cmdline() or []).lower()
+                        # 檢查是否是 multiprocessing spawn 進程
+                        if 'multiprocessing' in child_cmdline and 'spawn' in child_cmdline:
+                            # 檢查這個 spawn 進程的子進程數量
+                            # WebUI 總是有 1 個基礎子進程（用於日誌等）
+                            # 調度器啟動後會多 1 個子進程
+                            # 所以：子進程數 > 1 = 調度器運行中
+                            grandchildren = child.children(recursive=False)
+                            grandchild_count = len(grandchildren)
+                            if debug:
+                                logger.debug(f"spawn 進程 PID={child.pid}, 子進程數={grandchild_count}")
+                            if grandchild_count > 1:
+                                logger.debug(f"找到調度器進程: 子進程數={grandchild_count} > 1")
+                                return True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
         return False
     except ImportError:
@@ -770,6 +1057,105 @@ def daemon_mode(alas_path: str, config_name: str):
             time.sleep(60)
 
 
+def monitor_mode(alas_path: str, config_name: str):
+    """
+    純監控模式：只監控調度器狀態，停止後自動重啟（不休眠）
+
+    功能：
+    1. 持續監控調度器進程是否運行
+    2. 檢測到停止後等待 RESTART_DELAY_SECONDS 秒再重啟
+    3. 不執行任何休眠相關邏輯
+
+    使用方式：
+        python auto_sleep_wake.py --monitor-only
+    """
+    logger.info("=" * 50)
+    logger.info("=== 純監控模式啟動（只監控重啟，不休眠）===")
+    logger.info("=" * 50)
+    logger.info(f"ALAS 路徑: {alas_path}")
+    logger.info(f"配置名稱: {config_name}")
+    logger.info(f"檢查間隔: {CONFIG['DAEMON_CHECK_INTERVAL']} 秒")
+    logger.info("=" * 50)
+
+    setup_alas_path(alas_path)
+
+    # 啟動時列出所有相關進程（調試用）
+    logger.info("首次啟動，列出所有 ALAS 相關進程...")
+    list_alas_related_processes()
+
+    # 追蹤上一次狀態，用於日誌輸出
+    last_running_state = None
+    check_count = 0
+
+    while True:
+        try:
+            now = datetime.now()
+            is_running = check_alas_process_running(config_name)
+            check_count += 1
+
+            # 每次檢查都輸出日誌
+            status_str = "運行中" if is_running else "已停止"
+            logger.info(f"[{now.strftime('%H:%M:%S')}] 第 {check_count} 次檢查: 調度器{status_str}")
+
+            # 狀態變化時額外提醒
+            if last_running_state is not None and is_running != last_running_state:
+                if is_running:
+                    logger.info(">>> 狀態變化: 調度器已啟動")
+                else:
+                    logger.warning(">>> 狀態變化: 調度器已停止！")
+            last_running_state = is_running
+
+            if not is_running:
+                # 調度器停止，立即重啟（已有 60 秒檢查間隔，無需額外等待）
+                if not check_alas_process_running(config_name):
+                    logger.info("正在重啟調度器...")
+
+                    # 優先嘗試 GUI 點擊 WebUI 的啟動按鈕
+                    webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
+                    started = False
+
+                    if webui_running:
+                        logger.info("WebUI 運行中，嘗試通過 GUI 點擊啟動按鈕...")
+                        # 優先使用 UIA（最穩定），失敗再用相對座標
+                        started = click_webui_start_button_uia(config_name)
+                        if not started:
+                            logger.info("UIA 失敗，退回相對座標方法...")
+                            started = click_webui_start_button(config_name)
+
+                    if not started:
+                        # GUI 點擊失敗或 WebUI 未運行，回退到直接啟動
+                        if webui_running:
+                            logger.warning("GUI 點擊失敗，回退到直接啟動 alas.py")
+                        else:
+                            logger.info("WebUI 未運行，直接啟動 alas.py")
+                        started = start_scheduler_directly(config_name)
+
+                    if started:
+                        # 等待調度器啟動
+                        for i in range(10):
+                            time.sleep(2)
+                            if check_alas_process_running(config_name):
+                                logger.info("調度器已成功重啟")
+                                last_running_state = True
+                                break
+                        else:
+                            logger.error("調度器重啟失敗，將在下一個循環重試")
+                    else:
+                        logger.error("啟動調度器失敗")
+                else:
+                    logger.info("調度器已被其他方式啟動")
+                    last_running_state = True
+
+            time.sleep(CONFIG['DAEMON_CHECK_INTERVAL'])
+
+        except KeyboardInterrupt:
+            logger.info("收到中斷信號，停止監控")
+            break
+        except Exception as e:
+            logger.error(f"發生錯誤: {e}")
+            time.sleep(60)
+
+
 def main():
     import argparse
 
@@ -778,8 +1164,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 使用範例:
-    # Daemon 模式（推薦，持續運行）
+    # Daemon 模式（推薦，監控 + 自動休眠）
     python auto_sleep_wake.py --daemon
+
+    # 純監控模式（只監控重啟，不休眠）
+    python auto_sleep_wake.py --monitor-only
 
     # 單次執行
     python auto_sleep_wake.py
@@ -789,12 +1178,14 @@ def main():
 
     # 指定 ALAS 路徑
     python auto_sleep_wake.py "C:\\ALAS" --daemon
+    python auto_sleep_wake.py "C:\\ALAS" --monitor-only
         '''
     )
     parser.add_argument('alas_path', nargs='?', default='.', help='ALAS 安裝路徑')
     parser.add_argument('config_name', nargs='?', default='alas', help='配置名稱')
     parser.add_argument('--wake-action', action='store_true', help='執行喚醒動作（由任務計劃調用）')
-    parser.add_argument('--daemon', action='store_true', help='Daemon 模式持續運行')
+    parser.add_argument('--daemon', action='store_true', help='Daemon 模式持續運行（監控 + 自動休眠）')
+    parser.add_argument('--monitor-only', action='store_true', help='只監控調度器狀態，停止後自動重啟（不休眠）')
     parser.add_argument('--no-sleep', action='store_true', help='只設置喚醒任務，不休眠')
     parser.add_argument('--use-hibernate', action='store_true', help='使用休眠而非睡眠')
     parser.add_argument('--check-only', action='store_true', help='只檢查狀態')
@@ -844,7 +1235,12 @@ def main():
 
         return
 
-    # Daemon 模式
+    # 純監控模式（只監控重啟，不休眠）
+    if args.monitor_only:
+        monitor_mode(alas_path, args.config_name)
+        return
+
+    # Daemon 模式（監控 + 自動休眠）
     if args.daemon:
         daemon_mode(alas_path, args.config_name)
         return
