@@ -118,36 +118,22 @@ def check_pending_tasks(config_name: str = 'alas') -> int:
 
 def check_scheduler_running(config_name: str = 'alas') -> bool:
     """
-    檢查調度器是否正在執行任務（運行中）
+    檢查是否有正在運行中的任務（從配置文件判斷）
 
-    方法：檢查是否有 ALAS 相關的子進程在運行
+    ALAS UI 邏輯：
+    - pending_task[0] = 運行中（如果調度器進程活著）
+    - pending_task[1:] = 隊列中
+    - waiting_task = 等待中
+
+    從配置判斷：
+    - 有 pending 任務 = 有任務正在運行或等待執行
+    - 沒有 pending 任務 = 運行中無任務
+
+    Returns:
+        True = 有任務在運行中（pending > 0）
+        False = 運行中無任務（pending == 0）
     """
-    try:
-        import psutil
-
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                cmdline = proc.info.get('cmdline', []) or []
-                cmdline_str = ' '.join(cmdline).lower()
-
-                # 檢查是否是 ALAS 調度器進程
-                # 調度器會有 config_name 在命令行中
-                if config_name.lower() in cmdline_str:
-                    # 排除這個腳本本身
-                    if 'auto_sleep_wake' not in cmdline_str:
-                        # 排除 gui.py (WebUI 主進程)
-                        if 'gui.py' not in cmdline_str:
-                            return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        return False
-    except ImportError:
-        logger.warning("psutil 未安裝，無法檢測運行狀態")
-        return False
-    except Exception as e:
-        logger.warning(f"檢測運行狀態失敗: {e}")
-        return False
+    return check_pending_tasks(config_name) > 0
 
 
 def trigger_alas_start(config_name: str = 'alas') -> bool:
@@ -421,30 +407,26 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     計算休眠計劃
 
     休眠條件（全部滿足才休眠）：
-    1. 運行中無任務（調度器沒有在執行任務）
-    2. 隊列中無任務（pending_task = 0）
-    3. 等待中有任務（waiting_task > 0）
-    4. 等待中的第一個任務距離現在 > MIN_SLEEP_MINUTES（預設 10 分鐘）
+    1. 運行中/隊列中無任務（pending_task == 0）
+    2. 等待中有任務（waiting_task > 0）
+    3. 等待中的第一個任務距離現在 > MIN_SLEEP_MINUTES（預設 10 分鐘）
 
-    ALAS 任務狀態說明：
-    - pending: next_run < now，時間已到，排隊等待執行
-    - waiting: next_run >= now，時間未到，等待中
-    - running: 調度器子進程正在執行（通過 psutil 檢測）
+    ALAS 任務狀態說明（從 alas.json 配置判斷）：
+    - pending_task[0] = 運行中（UI 顯示）
+    - pending_task[1:] = 隊列中（UI 顯示）
+    - waiting_task = 等待中
+    - 只要 pending > 0，就表示有任務需要執行，不應休眠
 
     Returns:
         (should_sleep, wake_time, reason)
     """
-    # 條件 1：檢查調度器是否正在執行任務（運行中）
-    if check_scheduler_running(config_name):
-        return False, None, "調度器正在執行任務（運行中）"
-
     try:
         from module.config.config import AzurLaneConfig
 
         cfg = AzurLaneConfig(config_name)
         cfg.get_next_task()
 
-        pending = cfg.pending_task   # 時間已到（排隊中）
+        pending = cfg.pending_task   # 時間已到（運行中 + 隊列中）
         waiting = cfg.waiting_task   # 時間未到（等待中）
 
     except Exception as e:
@@ -453,12 +435,12 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
 
     now = datetime.now()
 
-    # 條件 2：隊列中無任務（pending = 0）
+    # 條件 1：運行中/隊列中無任務（pending == 0）
     if len(pending) > 0:
         task_names = [t.command for t in pending[:3]]
-        return False, None, f"隊列中有 {len(pending)} 個任務待執行: {task_names}"
+        return False, None, f"有 {len(pending)} 個任務運行中/待執行: {task_names}"
 
-    # 條件 3：必須有等待中的任務
+    # 條件 2：必須有等待中的任務
     if len(waiting) == 0:
         return False, None, "沒有等待中的任務"
 
@@ -470,7 +452,7 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     wake_time = next_run - timedelta(minutes=CONFIG['WAKE_BUFFER_MINUTES'])
     sleep_minutes = (wake_time - now).total_seconds() / 60
 
-    # 條件 4：等待中任務必須 > MIN_SLEEP_MINUTES 分鐘
+    # 條件 3：等待中任務必須 > MIN_SLEEP_MINUTES 分鐘
     if sleep_minutes < CONFIG['MIN_SLEEP_MINUTES']:
         return False, None, f"下個任務 {next_task.command} 只剩 {sleep_minutes:.1f} 分鐘，不休眠"
 
