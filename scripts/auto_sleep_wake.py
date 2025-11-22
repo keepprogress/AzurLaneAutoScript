@@ -334,7 +334,12 @@ def check_sleep_blockers() -> List[str]:
 
 
 def sleep_system(use_hibernate: bool = False) -> bool:
-    """使系統進入睡眠/休眠狀態"""
+    """
+    使系統進入睡眠/休眠狀態
+
+    關鍵：睡眠後不能再執行任何代碼！
+    用超長 sleep 卡住，防止極少數「假睡」情況下繼續執行
+    """
     if os.name != 'nt':
         logger.warning("非 Windows 系統，無法睡眠")
         return False
@@ -346,16 +351,21 @@ def sleep_system(use_hibernate: bool = False) -> bool:
             logger.warning(f"檢測到睡眠阻礙: {blockers}")
             kill_audio_requests()
 
-    logger.info(f"系統將在 5 秒後進入{'休眠' if use_hibernate else '睡眠'}...")
+    logger.info(f"系統即將進入{'休眠' if use_hibernate else '睡眠'}，5秒後執行...")
     time.sleep(5)
 
     if use_hibernate:
-        result = subprocess.run(['shutdown', '/h'], capture_output=True)
+        os.system('shutdown /h /f')
     else:
-        ps_cmd = 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState("Suspend", $false, $false)'
-        result = subprocess.run(['powershell', '-Command', ps_cmd], capture_output=True)
+        # 最可靠的 S3 睡眠方式，使用 ctypes 直接調用 Windows API
+        import ctypes
+        ctypes.windll.PowrProf.SetSuspendState(0, 1, 0)
 
-    return result.returncode == 0
+    # 絕對不能再執行任何程式碼！否則假睡時會繼續跑
+    # 用一個超長 sleep 卡住，防止極少數「假睡」情況下繼續執行
+    # 真正睡著後這行永遠不會執行到
+    time.sleep(999999999)
+    return True
 
 
 def wait_for_alas_tasks_complete(config_name: str, timeout_minutes: int = 120) -> bool:
@@ -526,10 +536,12 @@ def run_single_cycle(alas_path: str, config_name: str, no_sleep: bool = False):
 def wake_action(alas_path: str, config_name: str):
     """
     喚醒後執行的動作
-    關鍵：執行完後會自動進入下一個循環
+
+    關鍵改進：直接進入永久 daemon 模式，而不是只跑一次循環
+    這樣才能實現真正的永續自動化
     """
     logger.info("=" * 50)
-    logger.info("系統已喚醒 - 執行喚醒動作")
+    logger.info("系統已喚醒 → 自動接力進入永久 daemon 模式")
     logger.info("=" * 50)
 
     setup_alas_path(alas_path)
@@ -541,24 +553,29 @@ def wake_action(alas_path: str, config_name: str):
     # 確保 ALAS 運行
     ensure_alas_running(config_name)
 
-    # 等待一段時間讓任務開始執行
+    # 等待一段時間讓剛醒來的任務有時間進入 pending → running
     logger.info("等待任務開始執行 (60秒)...")
     time.sleep(60)
 
-    # 進入下一個循環
-    logger.info("進入下一個休眠循環...")
-    run_single_cycle(alas_path, config_name)
+    # 直接進入無限 daemon，永不結束！
+    # 這是關鍵：確保喚醒後能持續自動休眠循環
+    logger.info("進入永久 daemon 模式...")
+    daemon_mode(alas_path, config_name)
 
 
 def daemon_mode(alas_path: str, config_name: str):
     """
     Daemon 模式：持續運行，自動管理休眠循環
 
-    這是最推薦的運行方式，不依賴任務計劃喚醒
-    而是持續監控並在適當時機觸發休眠
+    這是最推薦的運行方式：
+    1. 持續監控 ALAS 狀態
+    2. 條件滿足時創建喚醒任務並休眠
+    3. 喚醒後由 wake_action() 重新進入此函數，實現永續循環
+
+    注意：sleep_system() 內有無限阻塞，真正睡著後不會返回
     """
     logger.info("=" * 50)
-    logger.info("ALAS Auto Sleep/Wake Manager - Daemon Mode")
+    logger.info("=== 永久 Daemon 模式啟動，從此無需手動干預 ===")
     logger.info("=" * 50)
     logger.info(f"ALAS 路徑: {alas_path}")
     logger.info(f"配置名稱: {config_name}")
@@ -579,23 +596,24 @@ def daemon_mode(alas_path: str, config_name: str):
             should_sleep, wake_time, reason = calculate_sleep_plan(config_name)
             logger.info(f"  {reason}")
 
-            if should_sleep:
+            if should_sleep and wake_time:
                 logger.info("條件滿足，準備進入休眠...")
 
-                # 創建喚醒任務（喚醒後會重啟這個 daemon）
-                create_wake_task(wake_time, alas_path, config_name)
+                # 創建喚醒任務（喚醒後執行 --wake-action，會重新進入 daemon_mode）
+                if not create_wake_task(wake_time, alas_path, config_name):
+                    logger.error("創建喚醒任務失敗，跳過本次休眠")
+                    time.sleep(CONFIG['DAEMON_CHECK_INTERVAL'])
+                    continue
 
-                # 創建一個標記文件，讓喚醒後的腳本知道要繼續 daemon 模式
-                daemon_flag = Path(alas_path) / 'config' / '.daemon_mode'
-                daemon_flag.write_text(config_name)
-
-                # 進入睡眠
+                # 進入睡眠（內部有無限阻塞，真正睡著後不會返回）
                 sleep_system(use_hibernate=CONFIG['USE_HIBERNATE'])
 
-                # 如果睡眠失敗（沒有真正睡著），繼續循環
-                logger.info("睡眠命令已執行，如果沒有睡著則繼續監控...")
-
-            time.sleep(CONFIG['DAEMON_CHECK_INTERVAL'])
+                # 如果執行到這裡，說明沒有真正睡著（極少數情況）
+                # 等待一段時間後繼續循環
+                logger.warning("睡眠命令執行但系統未睡著，30秒後重試...")
+                time.sleep(30)
+            else:
+                time.sleep(CONFIG['DAEMON_CHECK_INTERVAL'])
 
         except KeyboardInterrupt:
             logger.info("收到中斷信號，停止 daemon")
@@ -642,16 +660,7 @@ def main():
 
     alas_path = str(Path(args.alas_path).resolve())
 
-    # 檢查是否有 daemon 標記文件（從睡眠喚醒後）
-    daemon_flag = Path(alas_path) / 'config' / '.daemon_mode'
-    if daemon_flag.exists() and not args.wake_action:
-        config_name = daemon_flag.read_text().strip() or args.config_name
-        daemon_flag.unlink()
-        logger.info("檢測到 daemon 標記，恢復 daemon 模式")
-        daemon_mode(alas_path, config_name)
-        return
-
-    # 喚醒動作模式
+    # 喚醒動作模式（由任務計劃調用，會自動進入 daemon_mode）
     if args.wake_action:
         wake_action(alas_path, args.config_name)
         return
