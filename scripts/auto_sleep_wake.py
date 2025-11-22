@@ -51,6 +51,13 @@ CONFIG = {
     'DAEMON_CHECK_INTERVAL': 60,   # daemon 模式檢查間隔（秒）
     'USE_HIBERNATE': False,        # True=休眠, False=睡眠
     'KILL_AUDIO_BEFORE_SLEEP': True,  # 睡眠前殺掉音訊進程
+
+    # === 自動休眠時間限制 ===
+    'AUTO_SLEEP_SCHEDULE': True,   # 啟用時間限制
+    'SLEEP_DAYS': [0, 1, 2, 3, 4], # 允許自動休眠的星期（0=週一, 4=週五）
+    'SLEEP_START_HOUR': 1,         # 開始自動休眠的時間（01:00）
+    'SLEEP_END_HOUR': 19,          # 結束自動休眠的時間（19:00）
+    # 說明：週一到週五 01:00-19:00 之間會自動休眠，其他時間不休眠
 }
 
 # 設置日誌
@@ -134,6 +141,42 @@ def check_scheduler_running(config_name: str = 'alas') -> bool:
         False = 運行中無任務（pending == 0）
     """
     return check_pending_tasks(config_name) > 0
+
+
+def is_within_sleep_schedule() -> Tuple[bool, str]:
+    """
+    檢查當前時間是否在允許自動休眠的時段內
+
+    Returns:
+        (is_allowed, reason)
+    """
+    if not CONFIG['AUTO_SLEEP_SCHEDULE']:
+        return True, "時間限制已停用"
+
+    now = datetime.now()
+    current_day = now.weekday()  # 0=週一, 6=週日
+    current_hour = now.hour
+
+    # 檢查星期
+    if current_day not in CONFIG['SLEEP_DAYS']:
+        day_names = ['週一', '週二', '週三', '週四', '週五', '週六', '週日']
+        return False, f"今天是{day_names[current_day]}，不在自動休眠日"
+
+    # 檢查時間
+    start_hour = CONFIG['SLEEP_START_HOUR']
+    end_hour = CONFIG['SLEEP_END_HOUR']
+
+    if start_hour <= end_hour:
+        # 正常情況：例如 01:00 - 19:00
+        in_range = start_hour <= current_hour < end_hour
+    else:
+        # 跨夜情況：例如 22:00 - 06:00
+        in_range = current_hour >= start_hour or current_hour < end_hour
+
+    if not in_range:
+        return False, f"當前 {now.strftime('%H:%M')} 不在自動休眠時段 ({start_hour:02d}:00-{end_hour:02d}:00)"
+
+    return True, f"在自動休眠時段內 ({start_hour:02d}:00-{end_hour:02d}:00)"
 
 
 def trigger_alas_start(config_name: str = 'alas') -> bool:
@@ -407,6 +450,7 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     計算休眠計劃
 
     休眠條件（全部滿足才休眠）：
+    0. 在允許自動休眠的時段內（預設：週一到週五 01:00-19:00）
     1. 運行中/隊列中無任務（pending_task == 0）
     2. 等待中有任務（waiting_task > 0）
     3. 等待中的第一個任務距離現在 > MIN_SLEEP_MINUTES（預設 10 分鐘）
@@ -420,6 +464,11 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     Returns:
         (should_sleep, wake_time, reason)
     """
+    # 條件 0：檢查是否在允許自動休眠的時段內
+    schedule_ok, schedule_reason = is_within_sleep_schedule()
+    if not schedule_ok:
+        return False, None, schedule_reason
+
     try:
         from module.config.config import AzurLaneConfig
 
