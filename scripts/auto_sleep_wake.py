@@ -44,7 +44,7 @@ CONFIG = {
     'DEFAULT_CONFIG_NAME': 'alas',
     'WAKE_BUFFER_MINUTES': 5,      # 提前喚醒分鐘數
     'MIN_SLEEP_MINUTES': 10,       # 最小休眠時間（小於此值不休眠）
-    'MAX_SLEEP_HOURS': 8,          # 最大休眠時間（超過就不休眠，避免半夜無意義喚醒）
+    'MAX_SLEEP_HOURS': 0,          # 最大休眠時間，0=無限制（不限制休眠多久）
     'TASK_NAME': 'ALAS_AutoWake',
     'WEBUI_PORT': 22267,
     'WAIT_FOR_TASK_COMPLETE': 300, # 等待任務完成的檢查間隔（秒）
@@ -377,10 +377,13 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
     計算休眠計劃
 
     休眠條件（全部滿足才休眠）：
-    1. 運行中無任務（調度器 idle）
-    2. 隊列中無任務（pending_task = 0）
-    3. 等待中的任務距離現在 > MIN_SLEEP_MINUTES（10 分鐘）
-    4. 等待中的任務距離現在 < MAX_SLEEP_HOURS（8 小時）
+    1. 隊列中無任務（pending_task = 0，代表運行中+排隊中都沒有）
+    2. 等待中有任務（waiting_task > 0）
+    3. 等待中的第一個任務距離現在 > MIN_SLEEP_MINUTES（預設 10 分鐘）
+
+    ALAS 任務狀態說明：
+    - pending: next_run < now，時間已到，正在執行或排隊等待執行
+    - waiting: next_run >= now，時間未到，等待中
 
     Returns:
         (should_sleep, wake_time, reason)
@@ -391,8 +394,8 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
         cfg = AzurLaneConfig(config_name)
         cfg.get_next_task()
 
-        pending = cfg.pending_task   # 隊列中（時間已到，等待執行）
-        waiting = cfg.waiting_task   # 等待中（時間未到）
+        pending = cfg.pending_task   # 時間已到（運行中 + 排隊中）
+        waiting = cfg.waiting_task   # 時間未到（等待中）
 
     except Exception as e:
         logger.error(f"獲取排程失敗: {e}")
@@ -400,34 +403,41 @@ def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], st
 
     now = datetime.now()
 
-    # 條件 1 & 2：隊列中無任務（pending = 0）
-    # 注意：pending > 0 表示有任務正在執行或等待執行
+    # 條件 1：隊列中無任務（pending = 0）
+    # pending > 0 表示有任務正在執行或排隊等待
     if len(pending) > 0:
         task_names = [t.command for t in pending[:3]]
-        return False, None, f"隊列中有 {len(pending)} 個任務待執行: {task_names}"
+        return False, None, f"有 {len(pending)} 個任務執行中/排隊中: {task_names}"
 
-    # 條件 3：必須有等待中的任務
+    # 條件 2：必須有等待中的任務
     if len(waiting) == 0:
         return False, None, "沒有等待中的任務"
 
-    # 取第一個等待中的任務
+    # 取第一個等待中的任務（已按時間排序）
     next_task = waiting[0]
     next_run = next_task.next_run
 
-    # 計算到下一個任務的時間
+    # 計算喚醒時間（提前 WAKE_BUFFER_MINUTES 分鐘）
     wake_time = next_run - timedelta(minutes=CONFIG['WAKE_BUFFER_MINUTES'])
     sleep_minutes = (wake_time - now).total_seconds() / 60
 
-    # 條件 3：等待中任務 > 10 分鐘
+    # 條件 3：等待中任務必須 > MIN_SLEEP_MINUTES 分鐘
     if sleep_minutes < CONFIG['MIN_SLEEP_MINUTES']:
         return False, None, f"下個任務 {next_task.command} 只剩 {sleep_minutes:.1f} 分鐘，不休眠"
 
-    # 條件 4：避免太長時間後的無意義喚醒
-    max_minutes = CONFIG['MAX_SLEEP_HOURS'] * 60
-    if sleep_minutes > max_minutes:
-        return False, None, f"下個任務 {next_task.command} 在 {sleep_minutes/60:.1f} 小時後，太遠不休眠"
+    # 可選條件：最大休眠時間限制（0 = 無限制）
+    if CONFIG['MAX_SLEEP_HOURS'] > 0:
+        max_minutes = CONFIG['MAX_SLEEP_HOURS'] * 60
+        if sleep_minutes > max_minutes:
+            return False, None, f"下個任務 {next_task.command} 在 {sleep_minutes/60:.1f} 小時後，超過限制不休眠"
 
-    return True, wake_time, f"可休眠 {sleep_minutes:.1f} 分鐘，{wake_time.strftime('%H:%M')} 喚醒執行 {next_task.command}"
+    # 格式化顯示
+    if sleep_minutes >= 60:
+        duration_str = f"{sleep_minutes/60:.1f} 小時"
+    else:
+        duration_str = f"{sleep_minutes:.0f} 分鐘"
+
+    return True, wake_time, f"可休眠 {duration_str}，{wake_time.strftime('%H:%M')} 喚醒執行 {next_task.command}"
 
 
 def run_single_cycle(alas_path: str, config_name: str, no_sleep: bool = False):
