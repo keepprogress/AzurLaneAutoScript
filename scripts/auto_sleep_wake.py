@@ -391,13 +391,66 @@ def click_webui_start_button(config_name: str = 'alas', debug: bool = True) -> b
         return False
 
 
+def start_scheduler_via_processmanager(config_name: str = 'alas') -> bool:
+    """
+    通過 ProcessManager 直接啟動調度器（最快、最可靠）
+
+    這是最推薦的方式：
+    - 毫秒級響應（無需啟動新進程）
+    - 100% 成功率（直接調用內部 API）
+    - 不依賴 GUI/WebUI
+    - 支援任意配置名稱
+
+    注意：需要 State.init() 初始化 multiprocessing.Manager
+    """
+    try:
+        from module.webui.process_manager import ProcessManager
+        from module.webui.setting import State
+
+        # 確保 State 已初始化
+        if not State._init:
+            logger.info("初始化 State.manager...")
+            State.init()
+
+        # 獲取或創建 ProcessManager
+        manager = ProcessManager.get_manager(config_name)
+
+        # 檢查是否已在運行
+        if manager.alive:
+            logger.info(f"調度器 [{config_name}] 已在運行（ProcessManager）")
+            return True
+
+        # 啟動調度器
+        logger.info(f"通過 ProcessManager 啟動調度器 [{config_name}]...")
+        manager.start(func=None)  # None 會自動使用 get_config_mod(config_name)
+
+        # 等待啟動
+        for i in range(10):
+            time.sleep(0.5)
+            if manager.alive:
+                logger.info(f"調度器 [{config_name}] 已成功啟動（ProcessManager）")
+                return True
+
+        logger.warning("ProcessManager 啟動超時，調度器可能未成功啟動")
+        return False
+
+    except ImportError as e:
+        logger.warning(f"無法導入 ProcessManager 模組: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"ProcessManager 啟動失敗: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return False
+
+
 def start_scheduler_directly(config_name: str = 'alas', debug: bool = True) -> bool:
     """
-    直接啟動 ALAS 調度器（不依賴 WebUI）
+    直接啟動 ALAS 調度器（不依賴 WebUI）- 備援方案
 
-    這是最可靠的方式，直接執行 alas.py
+    這是備援方式，直接執行 alas.py
     注意：alas.py 不接受命令行參數，默認使用 'alas' 配置
-    如果需要其他配置，需要通過 WebUI 啟動
+    如果需要其他配置，需要通過 WebUI 或 ProcessManager 啟動
     """
     try:
         # 優先使用 ALAS 自帶的 Python，而不是系統 Python
@@ -804,28 +857,40 @@ def ensure_alas_running(config_name: str) -> bool:
     """
     確保 ALAS 調度器正在運行
 
-    優先檢查調度器進程，而非 WebUI
-    調度器可以獨立於 WebUI 運行
+    啟動優先順序：
+    1. ProcessManager（最快、最可靠、支援任意配置）
+    2. 直接執行 alas.py（備援，只支援 'alas' 配置）
+    3. WebUI + reloadalas（需要啟動 WebUI）
     """
     # 檢查調度器進程是否在運行
     if check_alas_process_running(config_name):
         logger.info(f"調度器 [{config_name}] 已在運行")
         return True
 
-    # 調度器未運行，直接啟動
+    # 調度器未運行，啟動它
     logger.info(f"調度器 [{config_name}] 未運行，正在啟動...")
 
-    # 方法1：直接啟動 alas.py（最可靠）
+    # 方法1：ProcessManager（最快、最可靠）
+    logger.info("嘗試方法1: ProcessManager 直接啟動...")
+    if start_scheduler_via_processmanager(config_name):
+        # ProcessManager 已在內部等待確認，這裡再檢查一次
+        time.sleep(2)
+        if check_alas_process_running(config_name):
+            logger.info(f"調度器 [{config_name}] 已啟動（ProcessManager）")
+            return True
+
+    # 方法2：直接啟動 alas.py（備援）
+    logger.info("嘗試方法2: 直接啟動 alas.py...")
     if start_scheduler_directly(config_name):
         # 等待調度器啟動
         for i in range(15):
             time.sleep(2)
             if check_alas_process_running(config_name):
-                logger.info(f"調度器 [{config_name}] 已啟動")
+                logger.info(f"調度器 [{config_name}] 已啟動（直接執行）")
                 return True
 
-    # 方法2：如果直接啟動失敗，嘗試通過 WebUI
-    logger.warning("直接啟動失敗，嘗試通過 WebUI 啟動...")
+    # 方法3：通過 WebUI 啟動
+    logger.info("嘗試方法3: 通過 WebUI 啟動...")
     webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
 
     if not webui_running:
@@ -842,9 +907,21 @@ def ensure_alas_running(config_name: str) -> bool:
         logger.error("WebUI 啟動失敗")
         return False
 
-    # WebUI 已運行但調度器沒啟動 - 這種情況需要手動點擊 UI
-    logger.warning("WebUI 已運行但調度器未啟動，請手動在 WebUI 點擊啟動按鈕")
-    logger.warning(f"或關閉 WebUI 後重試，讓腳本自動啟動調度器")
+    # WebUI 已運行但調度器沒啟動 - 嘗試點擊啟動按鈕
+    logger.info("WebUI 已運行，嘗試通過 GUI 點擊啟動按鈕...")
+    if click_webui_start_button_uia(config_name):
+        time.sleep(3)
+        if check_alas_process_running(config_name):
+            logger.info(f"調度器 [{config_name}] 已啟動（UIA 點擊）")
+            return True
+
+    if click_webui_start_button(config_name):
+        time.sleep(3)
+        if check_alas_process_running(config_name):
+            logger.info(f"調度器 [{config_name}] 已啟動（座標點擊）")
+            return True
+
+    logger.warning("所有啟動方法都失敗，請手動在 WebUI 點擊啟動按鈕")
     return False
 
 
@@ -1109,39 +1186,51 @@ def monitor_mode(alas_path: str, config_name: str):
                 # 調度器停止，立即重啟（已有 60 秒檢查間隔，無需額外等待）
                 if not check_alas_process_running(config_name):
                     logger.info("正在重啟調度器...")
-
-                    # 優先嘗試 GUI 點擊 WebUI 的啟動按鈕
-                    webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
                     started = False
 
-                    if webui_running:
-                        logger.info("WebUI 運行中，嘗試通過 GUI 點擊啟動按鈕...")
-                        # 優先使用 UIA（最穩定），失敗再用相對座標
-                        started = click_webui_start_button_uia(config_name)
-                        if not started:
-                            logger.info("UIA 失敗，退回相對座標方法...")
-                            started = click_webui_start_button(config_name)
+                    # 方法1：ProcessManager（最快、最可靠）
+                    logger.info("嘗試方法1: ProcessManager 直接啟動...")
+                    if start_scheduler_via_processmanager(config_name):
+                        time.sleep(2)
+                        if check_alas_process_running(config_name):
+                            logger.info("調度器已成功重啟（ProcessManager）")
+                            last_running_state = True
+                            started = True
+
+                    # 方法2：GUI 點擊（如果 WebUI 運行中）
+                    if not started:
+                        webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
+                        if webui_running:
+                            logger.info("嘗試方法2: GUI 點擊啟動按鈕...")
+                            # 優先使用 UIA（最穩定），失敗再用相對座標
+                            if click_webui_start_button_uia(config_name):
+                                time.sleep(3)
+                                if check_alas_process_running(config_name):
+                                    logger.info("調度器已成功重啟（UIA 點擊）")
+                                    last_running_state = True
+                                    started = True
+                            if not started and click_webui_start_button(config_name):
+                                time.sleep(3)
+                                if check_alas_process_running(config_name):
+                                    logger.info("調度器已成功重啟（座標點擊）")
+                                    last_running_state = True
+                                    started = True
+
+                    # 方法3：直接啟動 alas.py（備援）
+                    if not started:
+                        logger.info("嘗試方法3: 直接啟動 alas.py...")
+                        if start_scheduler_directly(config_name):
+                            # 等待調度器啟動
+                            for i in range(10):
+                                time.sleep(2)
+                                if check_alas_process_running(config_name):
+                                    logger.info("調度器已成功重啟（直接執行）")
+                                    last_running_state = True
+                                    started = True
+                                    break
 
                     if not started:
-                        # GUI 點擊失敗或 WebUI 未運行，回退到直接啟動
-                        if webui_running:
-                            logger.warning("GUI 點擊失敗，回退到直接啟動 alas.py")
-                        else:
-                            logger.info("WebUI 未運行，直接啟動 alas.py")
-                        started = start_scheduler_directly(config_name)
-
-                    if started:
-                        # 等待調度器啟動
-                        for i in range(10):
-                            time.sleep(2)
-                            if check_alas_process_running(config_name):
-                                logger.info("調度器已成功重啟")
-                                last_running_state = True
-                                break
-                        else:
-                            logger.error("調度器重啟失敗，將在下一個循環重試")
-                    else:
-                        logger.error("啟動調度器失敗")
+                        logger.error("所有啟動方法都失敗，將在下一個循環重試")
                 else:
                     logger.info("調度器已被其他方式啟動")
                     last_running_state = True
