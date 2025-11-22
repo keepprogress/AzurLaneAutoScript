@@ -46,7 +46,7 @@ from typing import Optional, Tuple, List
 CONFIG = {
     'DEFAULT_CONFIG_NAME': 'alas',
     'WAKE_BUFFER_MINUTES': 5,      # 提前喚醒分鐘數
-    'MIN_SLEEP_MINUTES': 10,       # 最小休眠時間（小於此值不休眠）
+    'MIN_SLEEP_MINUTES': 5,        # 最小休眠時間（小於此值不休眠）
     'MAX_SLEEP_HOURS': 0,          # 最大休眠時間，0=無限制（不限制休眠多久）
     'TASK_NAME': 'ALAS_AutoWake',
     'WEBUI_PORT': 22267,
