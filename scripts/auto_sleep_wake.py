@@ -216,6 +216,99 @@ def start_webui() -> bool:
     return False
 
 
+def start_scheduler_directly(config_name: str = 'alas') -> bool:
+    """
+    直接啟動 ALAS 調度器（不依賴 WebUI）
+
+    這是最可靠的方式，直接執行 alas.py
+    注意：alas.py 不接受命令行參數，默認使用 'alas' 配置
+    如果需要其他配置，需要通過 WebUI 啟動
+    """
+    try:
+        python_exe = sys.executable
+        alas_script = Path(os.getcwd()) / 'alas.py'
+
+        if not alas_script.exists():
+            logger.error(f"找不到 alas.py: {alas_script}")
+            return False
+
+        # 注意：alas.py 默認只使用 'alas' 配置
+        if config_name != 'alas':
+            logger.warning(f"alas.py 只支援 'alas' 配置，當前請求 '{config_name}'")
+            logger.warning("如需使用其他配置，請通過 WebUI 啟動")
+
+        if os.name == 'nt':
+            # Windows: 新視窗執行
+            subprocess.Popen(
+                [python_exe, str(alas_script)],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                cwd=os.getcwd()
+            )
+        else:
+            subprocess.Popen(
+                [python_exe, str(alas_script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=os.getcwd()
+            )
+
+        logger.info(f"已直接啟動調度器")
+        return True
+    except Exception as e:
+        logger.error(f"啟動調度器失敗: {e}")
+        return False
+
+
+def check_alas_process_running(config_name: str = 'alas') -> bool:
+    """
+    檢查 ALAS 調度器進程是否在運行
+
+    檢測方式：
+    1. 找 alas.py 進程（直接啟動）
+    2. 找包含 AzurLaneAutoScript 的進程（WebUI 啟動的子進程）
+
+    Returns:
+        True = 調度器進程正在運行
+        False = 調度器進程未運行
+    """
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline', []) or []
+                cmdline_str = ' '.join(cmdline).lower()
+
+                # 排除這個腳本本身
+                if 'auto_sleep_wake' in cmdline_str:
+                    continue
+                # 排除 WebUI 主進程
+                if 'gui.py' in cmdline_str:
+                    continue
+
+                # 檢查是否是 alas.py 進程（直接啟動）
+                if 'alas.py' in cmdline_str:
+                    return True
+
+                # 檢查是否是 WebUI 啟動的調度器子進程
+                # ProcessManager 啟動的進程會包含 config_name
+                if 'azurlaneautoscript' in cmdline_str or f'{config_name}' in cmdline_str:
+                    # 進一步確認是 Python 進程
+                    if 'python' in cmdline_str:
+                        return True
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        return False
+    except ImportError:
+        logger.warning("psutil 未安裝，無法檢測進程狀態")
+        return False
+    except Exception as e:
+        logger.warning(f"檢測進程狀態失敗: {e}")
+        return False
+
+
 def create_wake_task(wake_time: datetime, alas_path: str, config_name: str) -> bool:
     """
     創建 Windows 任務計劃，設置喚醒時間
@@ -421,11 +514,34 @@ def wait_for_alas_tasks_complete(config_name: str, timeout_minutes: int = 120) -
 
 
 def ensure_alas_running(config_name: str) -> bool:
-    """確保 ALAS 正在運行"""
+    """
+    確保 ALAS 調度器正在運行
+
+    優先檢查調度器進程，而非 WebUI
+    調度器可以獨立於 WebUI 運行
+    """
+    # 檢查調度器進程是否在運行
+    if check_alas_process_running(config_name):
+        logger.info(f"調度器 [{config_name}] 已在運行")
+        return True
+
+    # 調度器未運行，直接啟動
+    logger.info(f"調度器 [{config_name}] 未運行，正在啟動...")
+
+    # 方法1：直接啟動 alas.py（最可靠）
+    if start_scheduler_directly(config_name):
+        # 等待調度器啟動
+        for i in range(15):
+            time.sleep(2)
+            if check_alas_process_running(config_name):
+                logger.info(f"調度器 [{config_name}] 已啟動")
+                return True
+
+    # 方法2：如果直接啟動失敗，嘗試通過 WebUI
+    logger.warning("直接啟動失敗，嘗試通過 WebUI 啟動...")
     webui_running = check_webui_port(CONFIG['WEBUI_PORT'])
 
     if not webui_running:
-        logger.info("WebUI 未運行，正在啟動...")
         trigger_alas_start(config_name)
         start_webui()
 
@@ -433,16 +549,16 @@ def ensure_alas_running(config_name: str) -> bool:
         for i in range(30):
             time.sleep(2)
             if check_webui_port(CONFIG['WEBUI_PORT']):
-                logger.info("WebUI 已啟動")
+                logger.info("WebUI 已啟動，調度器應該會自動啟動")
                 return True
 
         logger.error("WebUI 啟動失敗")
         return False
 
-    # WebUI 運行中，確保調度器啟動
-    trigger_alas_start(config_name)
-    logger.info("ALAS 正在運行")
-    return True
+    # WebUI 已運行但調度器沒啟動 - 這種情況需要手動點擊 UI
+    logger.warning("WebUI 已運行但調度器未啟動，請手動在 WebUI 點擊啟動按鈕")
+    logger.warning(f"或關閉 WebUI 後重試，讓腳本自動啟動調度器")
+    return False
 
 
 def calculate_sleep_plan(config_name: str) -> Tuple[bool, Optional[datetime], str]:
